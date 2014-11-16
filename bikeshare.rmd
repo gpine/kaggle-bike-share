@@ -1,0 +1,194 @@
+---
+title: "An Approach to Kaggle's Bike Share Competition"
+author: "gpine"
+date: "Tuesday, November 11, 2014"
+output: html_document
+---
+
+This document discusses a straigtforward approach using R that yields a good score in Kaggle's [Bike Sharing Demand](http://www.kaggle.com/c/bike-sharing-demand) competition. The competition entails predicting demand for bikes in the Washington, D.C. bikeshare system. First I'll examine the data to decide on a model relating predictors to demand (the outcome). Then I'll use a random forest algorithm with default parameters.
+
+## 1. Initial exploration of the data
+The training set contains 12 variables, as shown below.
+
+```{r results='hide', message=FALSE, warning=FALSE}
+library(caret); library(ggplot2); library(randomForest); library('party'); library(Metrics)
+library(ada)
+training_raw <- read.csv("train.csv")
+testing_raw <- read.csv("test.csv")
+```
+```{r}
+str(training_raw)  # training_raw is the raw training data file
+```
+
+First, thinking about demand, one might expect that the time of day is an important factor. "Rush hour" will probably ential many cyclists going to and from work, raising demand. Late nights will probably see fewer riders. Thus I will extract the **hour** from the datetime variable.
+
+Second, note that many of these variables appear redundant or superfluous. "atemp," which is the "feels like" temperature, must be tightly correlated with the *actual* temperature from the "temp" variable. So I remove atemp from the model. My analysis suggests that the analyitical force of both "weekend" and "holiday" is more or less subsumed by the "workingday" variable, so I remove "weekend" and "holiday" from the model. As one might expect intuitively, the data do not suggest that humidity plays an important role in shaping demand, so I remove that as well. 
+
+Third, many of the items that appear as integers are actually categorical variables that should be converted to factors. For our purposes, hour, workingday, and weather will need to be converted. Weather has four categories, but the fourth one is hardly used, so I combine it with the third category.
+
+## 2. Interesting features of the data
+Let's set up the data based on the points above.
+```{r}
+set_up_features <- function(df) {
+  # Create an hour of the day variable from datetime
+  df$datetime <- strptime(df$datetime, format="%Y-%m-%d %H:%M:%S")
+  df$hour <- factor(df$datetime$hour)
+  
+  # Make sure that workingday is a factor
+  df$workingday <- factor(df$workingday)
+  
+  # Too few weather==4 values; switch them to 3.
+  df$weather[df$weather == 4] <- 3
+  df$weather <- factor(df$weather)
+  
+  df
+}
+
+training <- set_up_features(training_raw)
+testing <- set_up_features(testing_raw)
+```
+
+### The demand count is long-tailed.
+The most common demand rate is very low, like 1 or 2 bikes, but there are many instances of considerably higher demand.
+
+```{r}
+histogram(training$count, breaks=100, col="orange")
+```
+
+I decided to use the log of count instead of count itself. This is because it makes more sense to think in terms of percent growth in demand than in absolute growth. Also, when I used unlogged count in my model, the residuals were highly heteroskedastic. I attempted using a Box-Cox transformation to reduce the heteroskedasticity, but ultimately this did not yield better results in my prediction than taking the log. Note that demand is never below 1, so there are no issues with the log being, for example, -infinity.
+
+```{r}
+# Take the log of count
+training$lncount <- log(training$count)
+histogram(training$lncount, breaks=100, col="orange")
+```
+
+### Demand by hour
+The hourly demand displays a complicated pattern. Aggregating the hours into clumps to avoid having a factor with 24 levels might make sense for the purposes of statistical inference, but for prediction, given the pattern, I leave the hour variable as is. Note that 4 AM is the least busy time, while 5 PM is the busiest. Many of the hours have a lot of outliers at the high end of the spectrum.
+```{r}
+qplot(hour,count,data=training,geom="boxplot",xlab="Hour of the day (0 = midnight, 23 = 11 PM)")
+```
+
+### Higher temperature -> more demand
+My intuition suggested that there would be a set of temperatures -- say, between 60 and 80 degrees farenheit -- for which demand would peak. Then perhaps 50-60 and 80-90 would be the next level, and so forth. This intuition *is not* supported by the data. 
+
+```{r}
+fit <- lm(count ~ temp,data=training)
+par(mfrow = c(1, 1))
+plot(training$temp,training$count,xlab="Temperature (in degrees celcius)")
+abline(fit, lwd = 4,col="red")
+smoothingSpline = smooth.spline(training$temp,training$count, spar=0.35)
+lines(smoothingSpline, lwd = 4,col="orange")
+```
+
+Instead, demand rises in almost pure linear fashion with temperature until around 33C (91F), at which point it trails off.
+
+### Growing demand over time
+Another interesting and important point about this data is that although there are seasonal fluctuations, overall demand is increasing over time. The x-axis below shows how many hours have passed since the first date/time in the data. The y-axis is demand. 
+
+```{r}
+# Calculate the number of hours since the first data point in the training set.
+train_datelist <- strptime(training$datetime, format="%Y-%m-%d %H:%M:%S")
+test_datelist <- strptime(testing$datetime, format="%Y-%m-%d %H:%M:%S")
+training$hourspassed <- as.numeric(difftime(train_datelist, train_datelist[1], units="hours"))
+testing$hourspassed <- as.numeric(difftime(test_datelist, train_datelist[1], units="hours"))
+
+# See how demand changes with time
+fit <- lm(count ~ hourspassed,data=training)
+par(mfrow = c(1, 1))
+plot(training$hourspassed,training$count,xlab="Hours passed since the first data point")
+abline(fit, lwd = 4,col="red")
+smoothingSpline = smooth.spline(training$hourspassed,training$count, spar=0.35)
+lines(smoothingSpline, lwd = 4,col="orange")
+```
+
+The upward trend is clear. I therefore incorporate elapsed time into my model. (Note that the reason the data appear as vertical bars is that this is a training set, and the test set is the gaps in these bars). 
+
+## 3. Creating and testing the model
+
+Here I'll create my formula and do some tests. 
+
+### The model
+I tried a wide variety of formulas and ultimately arrived at a simple one (see the uncommented line in the code below). Some of the ideas expressed below include an interaction variable between workingday and weather, using season and holiday, using the Box-Cox transformation on "count" (by raising it to ^.222222), putting the temperature into categories, and incorporating the day of the month. This last idea relates to the fact that all of the test set variables are at the end of the month. 
+
+```{r}
+#formula <- count ~ season + holiday + workingday + weather + temp + atemp + humidity + hour + daypart + sunday
+#formula <- count ~ holiday + workingday + weather + temp + atemp + humidity + hour + sunday
+#formula <- formula <- count ~ season + holiday + workingday + weather + atemp + temp + humidity + hour + workingday*weather
+#formula <- count ~ season + workingday + weather + temp + hour + windspeed
+#formula <- lncount ~ season + workingday + weather + temp + hour + lnwind + year
+#formula <- count^.2222222 ~ season + workingday + weather + temp + hour + lnwind + hourspassed
+#formula <- lncount ~ season + workingday + weather + temp + hour + lnwind + hourspassed
+#formula <- lncount ~ workingday + weather + tempcat + hour + windspeed + hourspassed
+#formula <- lncount ~ workingday + weather + temp + daypart + windspeed + hourspassed
+#formula <- lncount ~ workingday + weather + temp + hour + windspeed + hourspassed + monthday
+formula <- lncount ~ workingday + weather + temp + hour + windspeed + hourspassed
+```
+
+Let's examine the above model.
+
+```{r}
+fit1 <- lm(formula, data=training)
+summary(fit1)$coef
+par(mfrow = c(2, 2))
+plot(fit1)
+```
+
+We see that every coefficient is highly significant. Looking at the above residual plots suggests that heteroskedasticity is not really an issue. There appears to be larger residuals below the predicted values than above it. Also, the distribution is heavy-tailed, and this may impact how we can interpret the coefficients.
+
+### Running a random forest algorithm on the above formula
+This model is not perfect, but it looks reasonably good, so I now further divide the training data into two sets for further testing. I use a random divider algorithm, although given how the actual training and test sets are divided, a smarter approach may be to divide based on day of the month. 
+
+```{r}
+set.seed(503)
+inTrain <- createDataPartition(training$count, p=0.7, list=F, times=1)
+train <- training[inTrain, ]
+cv <- training[-inTrain, ] # cross-validation set
+```
+
+I then run the random forest approach using default parameters.
+
+```{r}
+# Try a random forest approach
+set.seed(422)
+modFiti <- randomForest(formula, data=train)
+rfanswer <- predict(modFiti,cv)
+```
+
+Now let's see how well it did. First, I need to exponentiate the answers, since I had taken the log of the count variable earlier. A plot of the predicted vs actual values looks pretty good.
+
+
+```{r}
+# Exponentiate the predicted values since we took the log of count
+rfanswer <- exp(rfanswer)
+qplot(rfanswer,cv$count,xlab="Predicted demand count",ylab="Actual demand count")
+```
+
+Now check the root mean squared error (RMSE).
+
+```{r}
+rmsle(rfanswer, cv$count)
+```
+
+This value is very low, which is what we want. 
+
+### Submit to Kaggle
+To submit to Kaggle, I simply rerun the above code using the actual training and test sets, and then write it to a csv file.
+
+```{r eval=FALSE}
+###### FOR KAGGLE ########
+set.seed(422)
+modFit <- randomForest(formula, data=training)
+rfanswers <- predict(modFit,testing)
+rfanswers <- exp(rfanswers)
+
+#build a dataframe with our results
+submit.rfanswers <- data.frame(datetime = testing$datetime, count=rfanswers)
+
+#write results to .csv for submission
+write.csv(submit.rfanswers, file="submit_rfanswers_v1.csv",row.names=FALSE)
+```
+
+The RMSE results on the Kaggle leaderboard were not as good as when I did my own test above. This is somewhat perplexing, but I suspect that it has to do with the way that the training and test sets are divided by day of the month. Maybe there is something about the end of months that impacts bike demand. In any case, the resulting score was still high enough to be in the top quartile:
+
+![Kaggle results image: 261/1188](261.png)
